@@ -4,85 +4,130 @@ import pandas as pd
 import plotly.express as px
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Stock Price Dashboard", layout="wide")
+# --- ページ設定 ---
+st.set_page_config(
+    page_title="Stock Price Dashboard",
+    page_icon="📈",
+    layout="wide"
+)
 
-# Automatically refresh every 5 minutes (300000 milliseconds)
+# --- 自動更新設定 (5分ごと) ---
 st_autorefresh(interval=300000, limit=1000, key="data_refresh")
 
-st.title("株価ダッシュボード (S&P 500 & All Country)")
-st.markdown("Yahooファイナンスから取得した株価データを表示します。自動で更新されます。")
-
-# Tickers
+# --- 定数 ---
 TICKERS = {
     "S&P 500": "^GSPC",
-    "All Country (ACWI)": "ACWI" # iShares MSCI ACWI ETF as proxy
+    "All Country (ACWI)": "ACWI" # 代替として iShares MSCI ACWI ETF
 }
 
-@st.cache_data(ttl=300) # Cache for 5 mins
+# --- データ取得関数 ---
+@st.cache_data(ttl=300)
 def get_data(ticker, period="5y"):
     df = yf.Ticker(ticker).history(period=period)
     df.reset_index(inplace=True)
-    # yfinance Date is timezone-aware, convert to timezone-naive
     if df['Date'].dt.tz is not None:
          df['Date'] = df['Date'].dt.tz_localize(None)
     return df
 
 @st.cache_data(ttl=300)
-def get_current_price(ticker):
-    data = yf.Ticker(ticker).history(period="1d")
-    if not data.empty:
-        return data['Close'].iloc[-1]
-    return None
+def get_recent_prices(ticker):
+    # 前日比を出すために直近数日分のデータを取得
+    data = yf.Ticker(ticker).history(period="5d")
+    if len(data) >= 2:
+        return data['Close'].iloc[-1], data['Close'].iloc[-2]
+    elif len(data) == 1:
+        return data['Close'].iloc[-1], None
+    return None, None
 
-# Top section: Current Prices
-st.header("現在の株価")
-cols = st.columns(len(TICKERS))
+# --- サイドバー ---
+with st.sidebar:
+    st.header("⚙️ 設定")
+    granularity = st.radio(
+        "グラフの表示単位を選択:",
+        ("日次 (Daily)", "月次 (Monthly)", "年次 (Yearly)")
+    )
+    st.markdown("---")
+    st.info("**💡 Tips**\n\nこのダッシュボードは5分ごとに自動更新されます。データはYahooファイナンスから取得しています。")
 
-for idx, (name, symbol) in enumerate(TICKERS.items()):
-    price = get_current_price(symbol)
-    with cols[idx]:
-        if price:
-            st.metric(label=name, value=f"${price:,.2f}")
-        else:
-            st.metric(label=name, value="N/A")
+# --- メインコンテンツ ---
+st.title("📈 株価ダッシュボード (S&P 500 & All Country)")
+st.markdown("世界の主要な株価指数の現在の価格と推移を一覧できるダッシュボードです。")
 
 st.divider()
 
-# Bottom section: Historical Data
-st.header("株価推移")
+# --- 現在の株価 (Metrics) ---
+st.header("💵 現在の株価")
+metric_cols = st.columns(len(TICKERS))
 
-granularity = st.radio(
-    "表示単位を選択してください:",
-    ("日次 (Daily)", "月次 (Monthly)", "年次 (Yearly)"),
-    horizontal=True
-)
+for idx, (name, symbol) in enumerate(TICKERS.items()):
+    current_price, prev_price = get_recent_prices(symbol)
+    with metric_cols[idx]:
+        if current_price:
+            if prev_price:
+                delta = current_price - prev_price
+                delta_percent = (delta / prev_price) * 100
+                # 矢印と色付けをよしなにやってくれる Streamlit の metric を活用
+                st.metric(
+                    label=f"**{name}**",
+                    value=f"${current_price:,.2f}",
+                    delta=f"{delta:+,.2f} ({delta_percent:+.2f}%)"
+                )
+            else:
+                st.metric(label=f"**{name}**", value=f"${current_price:,.2f}")
+        else:
+            st.metric(label=f"**{name}**", value="データ取得エラー")
 
-for name, symbol in TICKERS.items():
-    st.subheader(name)
+st.markdown("<br>", unsafe_allow_html=True) # 少し余白を空ける
+
+# --- 株価推移 (Charts) ---
+st.header("📊 株価推移")
+
+chart_cols = st.columns(2) # グラフを左右に並べる
+
+for idx, (name, symbol) in enumerate(TICKERS.items()):
+    # 年次の場合は全期間、それ以外は直近5年を取得
     df = get_data(symbol, period="5y" if granularity != "年次 (Yearly)" else "max")
 
-    if df.empty:
-        st.warning(f"{name} のデータが取得できませんでした。")
-        continue
+    with chart_cols[idx]:
+        if df.empty:
+            st.warning(f"{name} のデータが取得できませんでした。")
+            continue
 
-    # Process data based on granularity
-    if granularity == "日次 (Daily)":
-        plot_df = df
-        x_label = "Date"
-    elif granularity == "月次 (Monthly)":
-        # Resample to monthly end
-        df.set_index('Date', inplace=True)
-        plot_df = df.resample('ME').last().reset_index()
-        x_label = "Date"
-    else: # Yearly
-        # Resample to yearly end
-        df.set_index('Date', inplace=True)
-        plot_df = df.resample('YE').last().reset_index()
-        plot_df['Year'] = plot_df['Date'].dt.year
-        x_label = "Year"
+        # 単位に応じたデータの加工
+        if granularity == "日次 (Daily)":
+            plot_df = df
+            x_label = "Date"
+        elif granularity == "月次 (Monthly)":
+            # 月末のデータでリサンプリング
+            df.set_index('Date', inplace=True)
+            plot_df = df.resample('ME').last().reset_index()
+            x_label = "Date"
+        else: # Yearly
+            # 年末のデータでリサンプリング
+            df.set_index('Date', inplace=True)
+            plot_df = df.resample('YE').last().reset_index()
+            plot_df['Year'] = plot_df['Date'].dt.year
+            x_label = "Year"
 
-    fig = px.line(plot_df, x=x_label, y="Close", title=f"{name} 推移 ({granularity})")
-    fig.update_xaxes(title_text="日付" if x_label == "Date" else "年")
-    fig.update_yaxes(title_text="終値 (USD)")
+        # 見やすいエリアチャート (塗りつぶしグラフ) を作成
+        fig = px.area(
+            plot_df,
+            x=x_label,
+            y="Close",
+            title=f"<b>{name}</b>",
+            color_discrete_sequence=["#1f77b4"] if idx == 0 else ["#2ca02c"] # S&Pは青、ACWIは緑
+        )
 
-    st.plotly_chart(fig, use_container_width=True)
+        # グラフのデザインを調整
+        fig.update_layout(
+            xaxis_title=None,
+            yaxis_title="終値 (USD)",
+            hovermode="x unified", # マウスオーバー時に縦線と値を表示
+            margin=dict(l=0, r=0, t=40, b=0),
+            plot_bgcolor="rgba(0,0,0,0)", # 背景を透明に
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        fig.update_xaxes(showgrid=False) # X軸のグリッド線を非表示
+        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#e0e0e0') # Y軸のグリッド線を薄く表示
+
+        st.plotly_chart(fig, use_container_width=True)
